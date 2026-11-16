@@ -1,50 +1,51 @@
 # Axiom Runtime: Architecture Specification
 
-## 1. Architectural Overview
-Axiom Runtime is structured as a **modular monolith** comprising six core engineering subsystems plus a provider-agnostic LLM Gateway. Each subsystem communicates strictly through typed Pydantic v2 contracts and Python `Protocol` interfaces so any layer can be tested, replaced, or scaled independently.
+## 1. System Topology
 
 ```mermaid
-flowchart TB
-    Client["API / CLI / Scheduler"] --> Engine["1. Execution Engine<br/>(Lifecycle & State Machine)"]
-    Engine --> Gateway["7. LLM Gateway<br/>(Provider Adapters)"]
-    Engine --> Policy["5. Policy Engine<br/>(Permissions & HITL Approvals)"]
-    Engine --> Tools["3. Tool Registry<br/>(Schema Validation & Idempotency)"]
-    Engine --> State["2. State Manager<br/>(Runs, Steps, Checkpoints, Locks)"]
-    Scheduler["4. Scheduler<br/>(Retries, Deadlines, Concurrency)"] --> Engine
-    Engine --> Telemetry["6. Observability<br/>(OTel Spans, Traces & Failure Taxonomy)"]
+flowchart TD
+    Client["Client / API Caller"] -->|"POST /runs"| API["FastAPI Control Plane"]
+    API --> Runner["AxiomRunner Engine"]
+    
+    subgraph Core["Axiom Runtime Core"]
+        Runner --> SM["Execution State Machine"]
+        Runner --> Policy["Policy Engine (ALLOW / HITL / DENY)"]
+        Runner --> Registry["Tool Registry (MCP + Schemas)"]
+        Runner --> Gateway["LLM Gateway Adapter"]
+    end
+    
+    subgraph Storage["Persistence & Isolation"]
+        Runner --> Store["State Store (SQLite / Postgres)"]
+        Store --> Checkpoints["Checkpoints & Step History"]
+        Store --> Invocations["Idempotent Tool Invocations"]
+        Store --> Approvals["Approval Queue"]
+    end
+    
+    Gateway -->|"Inference Request"| Models["Gemini / OpenAI / Anthropic"]
+    Registry -->|"Side-Effect Execution"| ExternalTools["APIs / Databases / MCP Servers"]
 ```
 
-## 2. Subsystem Contracts
+---
 
-### 2.1 Execution Engine (`axiom.engine`)
-- Drives an `AgentRun` through validated state transitions defined in `state_machine.py`.
-- Never holds unpersisted state across external I/O boundaries: every state transition is committed to the `StateStore` before and after model generation or tool invocation.
+## 2. Core Execution Invariants
 
-### 2.2 State Manager (`axiom.state`)
-- Persists `AgentRun`, `ExecutionStep`, `ToolInvocationRecord`, `Checkpoint`, and `ApprovalRequest`.
-- Enforces **run-level idempotency** (preventing duplicate task submissions via `idempotency_key`) and **optimistic concurrency control** (incrementing `version` on every state mutation).
-- Supports instant checkpoint restoration (`resume_run(run_id)`) from any interrupted step.
+1. **Pre-Invocation Recording**:
+   A tool invocation record with status `PENDING` and a deterministic idempotency key must be committed to the state store **before** the tool function is invoked.
 
-### 2.3 Tool Registry (`axiom.tools`)
-- Registers callable tools paired with Pydantic v2 input models and risk policies.
-- Computes a deterministic **tool idempotency key**:
-  `sha256(f"{run_id}:{step_index}:{tool_name}:{canonical_json(arguments)}")`
-- Before executing a tool, checks the `StateStore` for an existing `COMPLETED` `ToolInvocationRecord` with that key. If found, returns the cached output without re-executing the external side effect.
+2. **Optimistic Concurrency Control (OCC)**:
+   State updates to `AgentRun` require matching `version` increments. Any concurrent conflict aborts with `STATE_CONFLICT` to prevent split-brain execution across multiple workers.
 
-### 2.4 Scheduler & Retry Controller (`axiom.scheduler`)
-- Evaluates bounded retry policies (`max_attempts`, `initial_backoff_ms`, `multiplier`, `retryable_categories`).
-- Distinguishes between:
-  - **Transient errors** (`MODEL_TIMEOUT`, `TOOL_TRANSIENT_ERROR`) → transition to `RETRYING` and re-attempt.
-  - **Schema/validation errors** (`INVALID_TOOL_ARGUMENTS`) → feed structured validation error back to the model context or fail cleanly if retries are exhausted.
-  - **Terminal errors** (`APPROVAL_TIMEOUT`, `POLICY_DENIED`, `DEADLINE_EXCEEDED`) → transition immediately to `FAILED`.
+3. **Checkpoint Granularity**:
+   Every state transition produces a checkpoint snapshot containing serialized conversation context, tool history, and variable bindings.
 
-### 2.5 Policy Engine (`axiom.policy`)
-- Inspects every proposed tool invocation before execution.
-- Returns one of three decisions:
-  - `PolicyDecision.ALLOW`: Proceed immediately to `EXECUTING_TOOL`.
-  - `PolicyDecision.REQUIRE_APPROVAL`: Create an `ApprovalRequest`, checkpoint the run, and transition to `WAITING_FOR_APPROVAL`.
-  - `PolicyDecision.DENY`: Reject the tool call and fail or inform the agent.
+4. **Failure Category Normalization**:
+   Exceptions are caught, categorized using the standard 6-category failure taxonomy, and logged as structured `TraceEvent` records before triggering recovery or terminal transitions.
 
-### 2.6 Observability & Failure Classification (`axiom.telemetry`)
-- Records structured `TraceEvent` entries for every state transition, model call, tool invocation, retry, and approval gate.
-- Classifies every failure into a canonical `FailureCategory` enum used by the downstream **Agent Evaluation Lab** (`Project 03`).
+---
+
+## 3. Data Schema & Models
+
+- **`AgentRun`**: Represents the full execution lifecycle of a task instance. Contains `run_id`, `agent_name`, `status`, `current_step`, `version`, `config`, and `deadline_at`.
+- **`ExecutionStep`**: Detailed log of each turn including `state_from`, `state_to`, token usage, latency, and payloads.
+- **`ToolInvocation`**: Record of tool execution with unique `idempotency_key`, arguments, execution status, and cached output.
+- **`ApprovalRequest`**: HITL request record tracking risk evaluation, supervisor assignments, and approval decisions.

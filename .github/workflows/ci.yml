@@ -1,10 +1,10 @@
-name: Axiom Runtime CI
+name: CI Suite
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
   pull_request:
-    branches: [main]
+    branches: [ main, master ]
 
 jobs:
   test:
@@ -14,10 +14,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: Run unit & fault-injection test suite
-        run: pytest -v
+          pip install fastapi uvicorn pydantic pytest
+      - name: Run Test Suite
+        env:
+          PYTHONPATH: src
+        run: |
+          pytest -v tests/
