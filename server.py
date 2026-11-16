@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import uvicorn
+from fastapi.responses import RedirectResponse
 from axiom.api.app import create_fastapi_app
 from axiom.demo.research_agent import (
     build_research_tool_registry,
@@ -27,6 +28,12 @@ runner = AxiomRunner(
 runner.register_agent(create_research_agent_definition())
 
 app = create_fastapi_app(runner)
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """Redirect bare root URL to interactive Swagger API documentation."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health")
